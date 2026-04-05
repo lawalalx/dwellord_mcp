@@ -251,6 +251,31 @@ def build_redis_client() -> Optional[aioredis.Redis]:
 redis_client = build_redis_client()
 
 
+def disable_redis(reason: str, exc: Exception) -> None:
+    global redis_client
+    logger.warning("Redis disabled (%s): %s", reason, exc)
+    redis_client = None
+
+
+async def redis_get_safe(key: str) -> Optional[str]:
+    if not redis_client:
+        return None
+    try:
+        return await redis_client.get(key)
+    except Exception as exc:
+        disable_redis("get", exc)
+        return None
+
+
+async def redis_setex_safe(key: str, ttl_seconds: int, value: str) -> None:
+    if not redis_client:
+        return
+    try:
+        await redis_client.setex(key, ttl_seconds, value)
+    except Exception as exc:
+        disable_redis("setex", exc)
+
+
 @app.on_event("startup")
 async def startup_event() -> None:
     logger.info("Starting admin API")
@@ -259,7 +284,7 @@ async def startup_event() -> None:
             await redis_client.ping()
             logger.info("Redis connected")
         except Exception as exc:
-            logger.warning("Redis unavailable: %s", exc)
+            disable_redis("startup ping", exc)
 
     async with engine.begin() as conn:
         await conn.run_sync(SQLModel.metadata.create_all)
@@ -728,8 +753,7 @@ async def upload_property_media(
 
         await session.commit()
 
-        if redis_client:
-            await redis_client.setex(f"property:{property_id}:media", 600, "||".join(urls))
+        await redis_setex_safe(f"property:{property_id}:media", 600, "||".join(urls))
 
         return MediaUploadResponse(property_id=property_id, media_urls=urls)
 
@@ -745,16 +769,14 @@ async def get_property_media(property_id: str, current_user: AdminUser = Depends
         if not agent_visible_to_user(agent, current_user):
             raise HTTPException(status_code=404, detail="Property not found")
 
-        if redis_client:
-            cached = await redis_client.get(f"property:{property_id}:media")
-            if cached:
-                return MediaUploadResponse(property_id=property_id, media_urls=[u for u in cached.split("||") if u])
+        cached = await redis_get_safe(f"property:{property_id}:media")
+        if cached:
+            return MediaUploadResponse(property_id=property_id, media_urls=[u for u in cached.split("||") if u])
 
         result = await session.execute(select(PropertyImage.image_url).where(PropertyImage.property_id == property_id))
         urls = list(result.scalars().all())
 
-        if redis_client:
-            await redis_client.setex(f"property:{property_id}:media", 600, "||".join(urls))
+        await redis_setex_safe(f"property:{property_id}:media", 600, "||".join(urls))
 
         return MediaUploadResponse(property_id=property_id, media_urls=urls)
 
