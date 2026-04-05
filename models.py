@@ -353,7 +353,13 @@ class Payment(SQLModel, table=True):
 # ASYNC ENGINE
 # ---------------------------------------------------
 
-engine: AsyncEngine = create_async_engine(DATABASE_URL, echo=True, future=True)
+engine: AsyncEngine = create_async_engine(
+    DATABASE_URL,
+    echo=True,
+    future=True,
+    pool_pre_ping=True,
+    pool_recycle=300,
+)
 async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 

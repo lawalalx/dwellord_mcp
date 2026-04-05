@@ -325,7 +325,12 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> AdminUser:
         raise credentials_error from exc
 
     async with async_session() as session:
-        user = await session.get(AdminUser, user_id)
+        try:
+            user = await session.get(AdminUser, user_id)
+        except SQLAlchemyError as exc:
+            logger.exception("Database error while fetching current user")
+            raise HTTPException(status_code=503, detail="Database temporarily unavailable") from exc
+
         if not user or not user.is_active:
             raise credentials_error
         return user
@@ -729,19 +734,39 @@ async def upload_property_media(
         if not agent_visible_to_user(agent, current_user):
             raise HTTPException(status_code=404, detail="Property not found")
 
-        urls: list[str] = []
-        for idx, upload in enumerate(files):
+        prepared_files: list[bytes] = []
+        for upload in files:
+            # Browsers can submit empty placeholders when no file is selected.
+            if not (upload.filename or "").strip():
+                continue
             file_bytes = await upload.read()
-            result = cloudinary.uploader.upload(
-                file_bytes,
-                folder=f"house-agent/properties/{property_id}",
-                resource_type="auto",
-                public_id=f"{property_id}_{int(datetime.utcnow().timestamp())}_{idx}",
-                overwrite=True,
-            )
+            if not file_bytes:
+                continue
+            prepared_files.append(file_bytes)
+
+        if not prepared_files:
+            raise HTTPException(status_code=400, detail="No valid media files were provided")
+
+        if primary_index < 0 or primary_index >= len(prepared_files):
+            primary_index = 0
+
+        urls: list[str] = []
+        for idx, file_bytes in enumerate(prepared_files):
+            try:
+                result = cloudinary.uploader.upload(
+                    file_bytes,
+                    folder=f"house-agent/properties/{property_id}",
+                    resource_type="auto",
+                    public_id=f"{property_id}_{int(datetime.utcnow().timestamp())}_{idx}",
+                    overwrite=True,
+                )
+            except Exception as exc:
+                logger.exception("Cloudinary upload failed for property %s", property_id)
+                raise HTTPException(status_code=502, detail="Cloudinary upload failed") from exc
+
             secure_url = result.get("secure_url")
             if not secure_url:
-                raise HTTPException(status_code=500, detail="Cloudinary upload failed")
+                raise HTTPException(status_code=502, detail="Cloudinary upload failed")
 
             image = PropertyImage(
                 property_id=property_id,
