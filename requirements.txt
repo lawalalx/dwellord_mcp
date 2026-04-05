@@ -10,3 +10,10 @@ sqlalchemy>=2.0.32
 aiosqlite>=0.20.0
 pydantic-settings>=2.4.0
 email-validator>=2.2.0
+pydantic>=2.12.5
+mcp>=1.26.0
+cryptography
+loguru
+passlib>=1.7.4
+asyncpg
+python-dotenv
