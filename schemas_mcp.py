@@ -125,8 +125,14 @@ class ConfirmationState(MCPResponse):
 
 
 class PaymentResponse(MCPResponse):
-    payment_id: str
-    payment_url: str
+    payment_id: Optional[str] = None
+    payment_url: Optional[str] = None
+    payment_reference: Optional[str] = None
+    transfer_bank_name: Optional[str] = None
+    transfer_account_name: Optional[str] = None
+    transfer_account_number: Optional[str] = None
+    transfer_note: Optional[str] = None
+    expires_at: Optional[datetime] = None
     
     
 
@@ -181,6 +187,12 @@ class OrderResponse(MCPResponse):
 class PaymentResponse(MCPResponse):
     payment_id: Optional[str] = None
     payment_url: Optional[str] = None
+    payment_reference: Optional[str] = None
+    transfer_bank_name: Optional[str] = None
+    transfer_account_name: Optional[str] = None
+    transfer_account_number: Optional[str] = None
+    transfer_note: Optional[str] = None
+    expires_at: Optional[datetime] = None
     
     
 # ============================================================

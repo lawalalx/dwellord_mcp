@@ -7,6 +7,7 @@ from sqlalchemy.orm import selectinload
 from mcp.server.fastmcp.prompts import base
 from typing import Optional
 from datetime import datetime, date, timedelta, time
+from uuid import uuid4
 import sys, asyncio, uvicorn, os
 from dotenv import load_dotenv
 
@@ -451,7 +452,7 @@ async def create_property_lead(
 # ==========================
 # 🔹 Payment TOOLS
 # ==========================
-@post_tool(description="Initiate a secure payment for a property")
+@post_tool(description="Initiate a secure full payment for a property (no deposit/part-payment)")
 async def initiate_payment(
     property_id: str,
     client_name: str,
@@ -461,6 +462,35 @@ async def initiate_payment(
 ) -> PaymentResponse:
 
     async with async_session() as session:
+        property_obj = await session.get(Property, property_id)
+        if not property_obj:
+            return PaymentResponse(
+                success=False,
+                message="Property not found.",
+                error_code="PROPERTY_NOT_FOUND",
+            )
+
+        expected_amount = float(property_obj.price or 0)
+        if expected_amount <= 0:
+            return PaymentResponse(
+                success=False,
+                message="This property cannot be paid for right now. Please contact support.",
+                error_code="INVALID_PROPERTY_PRICE",
+            )
+
+        if float(amount) != expected_amount:
+            return PaymentResponse(
+                success=False,
+                message=(
+                    f"Only full payment is allowed for this property. "
+                    f"Please pay the exact full amount: {expected_amount:.2f}."
+                ),
+                error_code="FULL_PAYMENT_REQUIRED",
+            )
+
+        payment_reference = f"HA-{str(property_id)[:8].upper()}-{uuid4().hex[:8].upper()}"
+        expires_at = datetime.utcnow() + timedelta(minutes=45)
+
         payment = Payment(
             property_id=property_id,
             user_phone=client_phone,
@@ -471,13 +501,49 @@ async def initiate_payment(
         )
 
         session.add(payment)
+        audit = AuditLog(
+            entity_type=EntityType.PROPERTY,
+            entity_id=property_id,
+            action=AuditAction.PAYMENT_INITIATED,
+            user_phone=client_phone,
+            meta_data={
+                "payment_id": str(payment.id),
+                "payment_reference": payment_reference,
+                "amount": amount,
+                "purpose": str(purpose),
+                "expires_at": expires_at.isoformat(),
+                "client_name": client_name,
+            },
+        )
+        session.add(audit)
         await session.commit()
+
+        bank_name = os.getenv("PROTOTYPE_PAYMENT_BANK_NAME", "First Bank")
+        account_name = os.getenv("PROTOTYPE_PAYMENT_ACCOUNT_NAME", "Dwellord Properties Ltd")
+        account_number = os.getenv("PROTOTYPE_PAYMENT_ACCOUNT_NUMBER", "0000000000")
+
+        transfer_note = (
+            f"Transfer exactly {amount:.2f} with narration/reference: {payment_reference}. "
+            "When done, reply 'I HAVE PAID' or 'PAID'."
+        )
+
+        human_message = (
+            "Payment initialized for bank transfer verification. "
+            f"Use account {account_number} ({bank_name}, {account_name}) and reference {payment_reference}. "
+            "Only full payment is accepted. When done, reply 'I HAVE PAID' or 'PAID'."
+        )
 
         return PaymentResponse(
             success=True,
-            message="Payment initiated successfully",
-            payment_id=payment.id,
-            payment_url=f"https://pay.example.com/{payment.id}"
+            message=human_message,
+            payment_id=str(payment.id),
+            payment_url=None,
+            payment_reference=payment_reference,
+            transfer_bank_name=bank_name,
+            transfer_account_name=account_name,
+            transfer_account_number=account_number,
+            transfer_note=transfer_note,
+            expires_at=expires_at,
         )
 
 
@@ -707,6 +773,14 @@ def get_initial_prompts():
 
             - place_property_order(property_id, client_name, client_phone, offer_amount, message) → OrderResponse
             Purpose: Place an official order (intent-to-buy/rent). Ensure user understands commitment.
+
+            - initiate_payment(property_id, client_name, client_phone, amount, purpose) → PaymentResponse
+            Purpose: Initiate payment for a selected property.
+            Instructions:
+            - ONLY full payment is allowed. Deposits or part-payment are not allowed.
+            - Use the exact full property price as amount.
+            - After transfer instructions are shown, tell the user to reply "I HAVE PAID" or "PAID" when done.
+            Waiting Message: "Preparing payment information..."
 
             - lock_and_book(slot_id, lead_id) → Viewing
             Purpose: Lock a viewing slot for a lead. Prevent double-booking.
