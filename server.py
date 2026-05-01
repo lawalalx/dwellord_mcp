@@ -9,7 +9,19 @@ from typing import Optional
 from datetime import datetime, date, timedelta, time
 from uuid import uuid4
 import sys, asyncio, uvicorn, os
+import json
 from dotenv import load_dotenv
+
+from utils.redis_cache import (
+    CACHE_TTL_PROPERTY_DETAIL,
+    CACHE_TTL_SEARCH,
+    property_detail_cache_key,
+    property_search_cache_key,
+    redis_delete_safe,
+    redis_get_safe,
+    redis_invalidate_pattern,
+    redis_setex_safe,
+)
 
 from models import async_session
 from config import settings
@@ -101,6 +113,21 @@ async def search_properties(
     max_price: Optional[float] = None,
     bedrooms: Optional[int] = None
 ) -> PropertySearchResponse:
+
+    # ── Cache lookup ───────────────────────────────────────────────────────────
+    search_key = property_search_cache_key(
+        location=location,
+        property_type=property_type.value if property_type else None,
+        min_price=min_price,
+        max_price=max_price,
+        bedrooms=bedrooms,
+    )
+    cached_raw = await redis_get_safe(search_key)
+    if cached_raw:
+        try:
+            return PropertySearchResponse(**json.loads(cached_raw))
+        except Exception:
+            pass  # corrupt entry — fall through to DB
 
     async with async_session() as session:
 
@@ -207,7 +234,16 @@ async def search_properties(
             success=True,
             message=message,
             results=property_items
-        )     
+        )
+
+    # ── Populate cache ───────────────────────────────────────────────────────
+    response = PropertySearchResponse(
+        success=True,
+        message=message,
+        results=property_items
+    )
+    await redis_setex_safe(search_key, CACHE_TTL_SEARCH, json.dumps(response.model_dump(mode="json")))
+    return response
 
 @get_tool(description="""
     Get detailed information about a property using property_id.
@@ -216,6 +252,15 @@ async def search_properties(
 async def get_property_details(
     property_id: str
 ) -> PropertyDetailResponse:
+    # ── Cache lookup ───────────────────────────────────────────────────────
+    detail_key = property_detail_cache_key(property_id)
+    cached_raw = await redis_get_safe(detail_key)
+    if cached_raw:
+        try:
+            return PropertyDetailResponse(**json.loads(cached_raw))
+        except Exception:
+            pass
+
     async with async_session() as session:
         property_obj = await session.get(Property, property_id, options=[selectinload(Property.images)])
 
@@ -224,7 +269,7 @@ async def get_property_details(
 
         images = [img.image_url for img in property_obj.images]
 
-        return PropertyDetailResponse(
+        response = PropertyDetailResponse(
             success=True,
             message="Data fetched successfully",
             id=property_obj.id,
@@ -237,6 +282,10 @@ async def get_property_details(
             images=images,
             agent_id=property_obj.agent_id
         )
+
+    # ── Populate cache (only cache found properties) ────────────────────────
+    await redis_setex_safe(detail_key, CACHE_TTL_PROPERTY_DETAIL, json.dumps(response.model_dump(mode="json")))
+    return response
 
 
 # ==========================
@@ -325,8 +374,12 @@ async def reserve_property(
         )
 
         session.add_all([property_obj, reservation, audit])
-
         await session.commit()
+
+        # Property status changed to PENDING — invalidate so both frontend and
+        # the WhatsApp bot show updated availability immediately
+        await redis_delete_safe(property_detail_cache_key(property_id))
+        await redis_invalidate_pattern("properties:search:*")
 
         return ReservationResponse(
             success=True,
@@ -684,10 +737,10 @@ def get_initial_prompts():
     return [
         base.UserMessage(
         """
-           You are "EstateAgent AI", an intelligent, empathetic, and highly capable assistant specializing in real estate rentals and sales. Your primary goal is to help users find properties that match their criteria by leveraging the available internal tools to provide accurate, actionable, and structured responses.
+           You are "Dwellord AI", an intelligent, empathetic, and highly capable assistant specializing in real estate rentals and sales. Your primary goal is to help users find properties that match their criteria by leveraging the available internal tools to provide accurate, actionable, and structured responses.
 
             1️⃣ Role & Persona
-            Identity: HomeFinder AI, a knowledgeable, patient, and helpful real estate assistant.
+            Identity: Dwellord AI, a knowledgeable, patient, and helpful real estate assistant.
             Objective: Simplify the property search process, and guide users through their real estate journey.
             Tone: Professional, friendly, empathetic, and always clear in instructions.
 
@@ -921,8 +974,12 @@ def create_starlette_app(mcp_server):
         # Return an empty response to satisfy Starlette's requirement for a Response object
         return Response() 
 
+    async def handle_root(request):
+        return Response("I am alive", media_type="text/plain")
+
     return Starlette(
         routes=[
+            Route("/", endpoint=handle_root),
             Route("/sse", endpoint=handle_sse),
             Mount("/messages/", app=sse.handle_post_message),
         ]

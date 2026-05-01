@@ -4,11 +4,11 @@ import os
 from datetime import date, datetime, timedelta
 from enum import Enum
 from typing import Optional
+import json
 import logging
 
 import cloudinary
 import cloudinary.uploader
-import redis.asyncio as aioredis
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
@@ -21,6 +21,20 @@ from sqlalchemy.future import select
 from sqlmodel import Field as SQLField
 from sqlmodel import SQLModel
 from dotenv import load_dotenv
+
+from utils.redis_cache import (
+    CACHE_TTL_PROPERTIES_LIST,
+    CACHE_TTL_PROPERTY_DETAIL,
+    close_redis,
+    disable_redis,
+    ping_redis,
+    property_detail_cache_key,
+    property_list_cache_key,
+    redis_delete_safe,
+    redis_get_safe,
+    redis_invalidate_pattern,
+    redis_setex_safe,
+)
 
 
 load_dotenv()
@@ -222,78 +236,17 @@ app.add_middleware(
 )
 
 
-
-REDIS_URL = os.getenv("REDIS_URL")
-REDIS_HOST = os.getenv("REDIS_HOST")
-REDIS_PORT = os.getenv("REDIS_PORT")
-REDIS_USERNAME = os.getenv("REDIS_USERNAME")
-REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
-REDIS_SSL = os.getenv("REDIS_SSL", "false").lower() == "true"
-
-
-def build_redis_client() -> Optional[aioredis.Redis]:
-    if REDIS_URL:
-        return aioredis.from_url(REDIS_URL, decode_responses=True)
-
-    if REDIS_HOST and REDIS_PORT and REDIS_PASSWORD:
-        return aioredis.Redis(
-            host=REDIS_HOST,
-            port=int(REDIS_PORT),
-            decode_responses=True,
-            username=REDIS_USERNAME or "default",
-            password=REDIS_PASSWORD,
-            ssl=REDIS_SSL,
-        )
-
-    return None
-
-
-redis_client = build_redis_client()
-
-
-def disable_redis(reason: str, exc: Exception) -> None:
-    global redis_client
-    logger.warning("Redis disabled (%s): %s", reason, exc)
-    redis_client = None
-
-
-async def redis_get_safe(key: str) -> Optional[str]:
-    if not redis_client:
-        return None
-    try:
-        return await redis_client.get(key)
-    except Exception as exc:
-        disable_redis("get", exc)
-        return None
-
-
-async def redis_setex_safe(key: str, ttl_seconds: int, value: str) -> None:
-    if not redis_client:
-        return
-    try:
-        await redis_client.setex(key, ttl_seconds, value)
-    except Exception as exc:
-        disable_redis("setex", exc)
-
-
 @app.on_event("startup")
 async def startup_event() -> None:
     logger.info("Starting admin API")
-    if redis_client:
-        try:
-            await redis_client.ping()
-            logger.info("Redis connected")
-        except Exception as exc:
-            disable_redis("startup ping", exc)
-
+    await ping_redis()
     async with engine.begin() as conn:
         await conn.run_sync(SQLModel.metadata.create_all)
 
 
 @app.on_event("shutdown")
 async def shutdown_event() -> None:
-    if redis_client:
-        await redis_client.close()
+    await close_redis()
 
 
 
@@ -583,7 +536,11 @@ async def create_property(
         session.add(property_obj)
         await session.commit()
         await session.refresh(property_obj)
-        return await serialize_property(property_obj)
+        response = await serialize_property(property_obj)
+
+    # New listing — bust the agency list cache so it appears immediately
+    await redis_invalidate_pattern(f"properties:list:{current_user.agency_id}:*")
+    return response
 
 
 @app.get("/api/v1/properties", response_model=list[PropertyResponse])
@@ -595,6 +552,23 @@ async def list_properties(
     status_filter: Optional[PropertyStatus] = Query(default=None),
     current_user: AdminUser = Depends(get_current_user),
 ) -> list[PropertyResponse]:
+    # ── Cache lookup ─────────────────────────────────────────────────────────
+    cache_key = property_list_cache_key(
+        agency_id=current_user.agency_id,
+        role=current_user.role.value,
+        location=location,
+        min_price=min_price,
+        max_price=max_price,
+        bedrooms=bedrooms,
+        status_filter=status_filter.value if status_filter else None,
+    )
+    cached_raw = await redis_get_safe(cache_key)
+    if cached_raw:
+        try:
+            return [PropertyResponse(**item) for item in json.loads(cached_raw)]
+        except Exception:
+            pass  # corrupt cache entry — fall through to DB
+
     async with async_session() as session:
         query = select(Property).join(Agent, Agent.id == Property.agent_id).order_by(Property.created_at.desc())
 
@@ -619,11 +593,19 @@ async def list_properties(
         for property_obj in properties:
             responses.append(await serialize_property(property_obj))
 
-        return responses
+    # ── Populate cache ───────────────────────────────────────────────────────
+    await redis_setex_safe(
+        cache_key,
+        CACHE_TTL_PROPERTIES_LIST,
+        json.dumps([r.model_dump(mode="json") for r in responses]),
+    )
+    return responses
 
 
 @app.get("/api/v1/properties/{property_id}", response_model=PropertyResponse)
 async def get_property(property_id: str, current_user: AdminUser = Depends(get_current_user)) -> PropertyResponse:
+    detail_key = property_detail_cache_key(property_id)
+
     async with async_session() as session:
         property_obj = await session.get(Property, property_id)
         if not property_obj:
@@ -633,7 +615,18 @@ async def get_property(property_id: str, current_user: AdminUser = Depends(get_c
         if not agent_visible_to_user(agent, current_user):
             raise HTTPException(status_code=404, detail="Property not found")
 
-        return await serialize_property(property_obj)
+        # ── Cache lookup (after auth/visibility check) ────────────────────────
+        cached_raw = await redis_get_safe(detail_key)
+        if cached_raw:
+            try:
+                return PropertyResponse(**json.loads(cached_raw))
+            except Exception:
+                pass
+
+        response = await serialize_property(property_obj)
+
+    await redis_setex_safe(detail_key, CACHE_TTL_PROPERTY_DETAIL, json.dumps(response.model_dump(mode="json")))
+    return response
 
 
 @app.patch("/api/v1/properties/{property_id}", response_model=PropertyResponse)
@@ -657,8 +650,72 @@ async def update_property(
 
         await session.commit()
         await session.refresh(property_obj)
-        return await serialize_property(property_obj)
+        response = await serialize_property(property_obj)
 
+    await redis_invalidate_pattern(f"properties:list:{current_user.agency_id}:*")
+    await redis_delete_safe(property_detail_cache_key(property_id))
+    return response
+
+
+# Add after the existing media endpoints
+@app.delete("/api/v1/properties/{property_id}/media")
+async def delete_property_image(
+    property_id: str,
+    url: str = Query(..., description="URL of the image to remove"),
+    current_user: AdminUser = Depends(get_current_user),
+):
+    async with async_session() as session:
+        property_obj = await session.get(Property, property_id)
+        if not property_obj:
+            raise HTTPException(status_code=404, detail="Property not found")
+        agent = await session.get(Agent, property_obj.agent_id)
+        if not agent_visible_to_user(agent, current_user):
+            raise HTTPException(status_code=404, detail="Property not found")
+        # Remove the image from the DB
+        result = await session.execute(
+            delete(PropertyImage).where(
+                PropertyImage.property_id == property_id,
+                PropertyImage.image_url == url
+            )
+        )
+        await session.commit()
+        # Remove from cloud storage (Cloudinary)
+        try:
+            public_id = None
+            # Extract public_id from the URL if possible (Cloudinary URLs are usually like .../v1234/folder/public_id.ext)
+            if url:
+                # This logic assumes the public_id is the last part of the path before the extension
+                from urllib.parse import urlparse
+                import re
+                parsed = urlparse(url)
+                # Remove extension
+                path = parsed.path
+                match = re.search(r'/([^/]+)\.[a-zA-Z0-9]+$', path)
+                if match:
+                    public_id = match.group(1)
+                    # If you use folders, prepend them
+                    folder_match = re.match(r'/(.+)/([^/]+)\.[a-zA-Z0-9]+$', path)
+                    if folder_match:
+                        public_id = folder_match.group(1) + '/' + folder_match.group(2)
+            if public_id:
+                cloudinary.uploader.destroy(public_id)
+        except Exception as exc:
+            logger.warning(f"Failed to remove image from Cloudinary: {exc}")
+
+        # Update Redis cache for property media
+        try:
+            result = await session.execute(select(PropertyImage.image_url).where(PropertyImage.property_id == property_id))
+            urls = list(result.scalars().all())
+            await redis_setex_safe(f"property:{property_id}:media", 600, "||".join(urls))
+        except Exception as exc:
+            logger.warning(f"Failed to update Redis cache for property media: {exc}")
+
+        # Invalidate detail + list so frontend sees updated images immediately
+        await redis_delete_safe(property_detail_cache_key(property_id))
+        await redis_invalidate_pattern(f"properties:list:{current_user.agency_id}:*")
+
+        return {"success": True}
+    
 
 @app.delete("/api/v1/properties/{property_id}")
 async def delete_property(property_id: str, current_user: AdminUser = Depends(get_current_user)) -> dict:
@@ -690,6 +747,8 @@ async def delete_property(property_id: str, current_user: AdminUser = Depends(ge
 
             await session.delete(property_obj)
             await session.commit()
+            await redis_invalidate_pattern(f"properties:list:{current_user.agency_id}:*")
+            await redis_delete_safe(property_detail_cache_key(property_id))
             return {"success": True}
         except IntegrityError as exc:
             await session.rollback()
@@ -715,7 +774,11 @@ async def deactivate_property(property_id: str, current_user: AdminUser = Depend
         property_obj.status = PropertyStatus.PENDING
         await session.commit()
         await session.refresh(property_obj)
-        return await serialize_property(property_obj)
+        response = await serialize_property(property_obj)
+
+    await redis_invalidate_pattern(f"properties:list:{current_user.agency_id}:*")
+    await redis_delete_safe(property_detail_cache_key(property_id))
+    return response
 
 
 @app.post("/api/v1/properties/{property_id}/media", response_model=MediaUploadResponse)
@@ -779,6 +842,9 @@ async def upload_property_media(
         await session.commit()
 
         await redis_setex_safe(f"property:{property_id}:media", 600, "||".join(urls))
+        # Images changed -- invalidate detail + list so frontend sees them immediately
+        await redis_delete_safe(property_detail_cache_key(property_id))
+        await redis_invalidate_pattern(f"properties:list:{current_user.agency_id}:*")
 
         return MediaUploadResponse(property_id=property_id, media_urls=urls)
 
@@ -1057,3 +1123,7 @@ async def dashboard_summary(current_user: AdminUser = Depends(get_current_user))
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+@app.get("/")
+async def health() -> dict[str, str]:
+    return {"status": "I am alive and well!"}
