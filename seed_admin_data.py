@@ -51,15 +51,15 @@ async def run_seed() -> None:
             return
 
         agency_prime = Agency(
-            name="Prime Estates",
-            email="contact@primeestates.com",
-            phone="+2348012345678",
+            name="Dwellord Properties",
+            email="contact@dwellord.com",
+            phone="+2349013360717",
             address="Lagos, Nigeria",
             created_at=datetime.utcnow(),
         )
         agency_elite = Agency(
-            name="Elite Properties",
-            email="hello@eliteprops.com",
+            name="Dwellord Properties",
+            email="info@dwellord.com",
             phone="+2348098765432",
             address="Abuja, Nigeria",
             created_at=datetime.utcnow(),
@@ -69,15 +69,15 @@ async def run_seed() -> None:
 
         agent_temi = Agent(
             agency_id=agency_prime.id,
-            full_name="Temitola Adeyemi",
-            email="temi@primeestates.com",
-            phone="+2348123456789",
+            full_name="Olanrewaju Lawal",
+            email="lawal@dwellord.com",
+            phone="+2349038433047",
             created_at=datetime.utcnow(),
         )
         agent_chinonso = Agent(
             agency_id=agency_elite.id,
-            full_name="Chinonso Okeke",
-            email="chinonso@eliteprops.com",
+            full_name="Olanrewaju Lawal",
+            email="lanre@dwellord.com",
             phone="+2348187654321",
             created_at=datetime.utcnow(),
         )
@@ -86,7 +86,7 @@ async def run_seed() -> None:
 
         admin = AdminUser(
             id=os.urandom(16).hex(),
-            email="admin@primeestates.com",
+            email="admin@dwellord.com",
             full_name="Platform Admin",
             password_hash=hash_password("Admin@12345"),
             role=AdminRole.ADMIN,
@@ -96,8 +96,8 @@ async def run_seed() -> None:
 
         agent_user = AdminUser(
             id=os.urandom(16).hex(),
-            email="temi@primeestates.com",
-            full_name="Temitola Adeyemi",
+            email="lawal@dwellord.com",
+            full_name="Olanrewaju Lawal",
             password_hash=hash_password("Agent@12345"),
             role=AdminRole.AGENT,
             agency_id=agency_prime.id,
@@ -301,8 +301,8 @@ async def run_seed() -> None:
         await session.commit()
 
     print("Admin seed completed.")
-    print("Admin login: admin@primeestates.com / Admin@12345")
-    print("Agent login: temi@primeestates.com / Agent@12345")
+    print("Admin login: admin@dwellord.com / Admin@12345")
+    print("Agent login: lawal@dwellord.com / Agent@12345")
     print("Sample properties, leads, and viewings have been created.")
 
 
